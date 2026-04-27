@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+<title>Chromatic Tuner</title>
+
+<!-- iOS home-screen / fullscreen support -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Tuner" />
+<meta name="theme-color" content="#0a0d14" />
+
+<!-- Inline SVG touch icon (tuning fork) so no extra files are needed -->
+<link rel="apple-touch-icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect width='180' height='180' rx='40' fill='%230a0d14'/><g fill='none' stroke='%23a8d8a8' stroke-width='8' stroke-linecap='round'><line x1='70' y1='40' x2='70' y2='100'/><line x1='110' y1='40' x2='110' y2='100'/><path d='M70 100 Q90 120 90 135 L90 150'/><path d='M110 100 Q90 120 90 135'/></g></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0a0d14;
+    /* prevent rubber-band scroll on iOS when running fullscreen */
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    /* respect the notch / home indicator on iPhone */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    min-height: 100vh;
+  }
+  * { box-sizing: border-box; }
+  button {
+    font-family: inherit;
+    -webkit-appearance: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: manipulation; /* removes 300ms tap delay */
+  }
+  /* iOS zooms on focus when input font-size < 16px — prevent that */
+  select, input { font-size: 16px; }
+  input[type=range] { accent-color: #a8d8a8; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+const NOTE_SHARPS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const NOTE_FLATS  = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+
+const INSTRUMENTS = [
+  { id: "concert", label: "Concert pitch (C)", semitones: 0 },
+  { id: "bb", label: "B♭ instrument (trumpet, clarinet, tenor sax)", semitones: 2 },
+  { id: "eb", label: "E♭ instrument (alto sax, alto clarinet)", semitones: 9 },
+  { id: "f", label: "F instrument (French horn, English horn)", semitones: 7 },
+  { id: "bb_bass", label: "B♭ bass (bass clarinet, tenor sax 8va)", semitones: 14 },
+  { id: "guitar", label: "Guitar (sounds 8va below written)", semitones: -12 },
+];
+
+function freqToNote(freq, a4 = 440, useFlats = false, transposeSemitones = 0) {
+  if (!freq || freq <= 0) return null;
+  const concertMidi = 69 + 12 * Math.log2(freq / a4);
+  const writtenMidiFloat = concertMidi + transposeSemitones;
+  const midi = Math.round(writtenMidiFloat);
+  const cents = Math.round((writtenMidiFloat - midi) * 100);
+  const names = useFlats ? NOTE_FLATS : NOTE_SHARPS;
+  const note = names[((midi % 12) + 12) % 12];
+  const octave = Math.floor(midi / 12) - 1;
+  return { note, octave, cents, midi, freq };
+}
+
+function noteToFreq(noteName, octave, a4 = 440) {
+  const sharpsIdx = NOTE_SHARPS.indexOf(noteName);
+  const flatsIdx = NOTE_FLATS.indexOf(noteName);
+  const idx = sharpsIdx >= 0 ? sharpsIdx : flatsIdx;
+  if (idx < 0) return null;
+  const midi = (octave + 1) * 12 + idx;
+  return a4 * Math.pow(2, (midi - 69) / 12);
+}
+
+function autoCorrelate(buf, sampleRate) {
+  const SIZE = buf.length;
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.01) return -1;
+
+  // Trim quiet edges (same as before)
+  let r1 = 0, r2 = SIZE - 1;
+  const thres = 0.2;
+  for (let i = 0; i < SIZE / 2; i++) if (Math.abs(buf[i]) < thres) { r1 = i; break; }
+  for (let i = 1; i < SIZE / 2; i++) if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+  const trimmed = buf.slice(r1, r2);
+  const n = trimmed.length;
+
+  // Only search lag range corresponding to plausible musical pitches.
+  // 50 Hz lower bound covers low autoharp bass strings. 1500 Hz upper covers
+  // high notes. This turns the inner loop from O(n²) into O(n * lagRange).
+  const minLag = Math.max(2, Math.floor(sampleRate / 1500));
+  const maxLag = Math.min(n - 2, Math.floor(sampleRate / 50));
+
+  let bestLag = -1;
+  let bestCorr = 0;
+  let prevCorr = 0;
+  let foundDip = false;
+
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let corr = 0;
+    const limit = n - lag;
+    for (let j = 0; j < limit; j++) corr += trimmed[j] * trimmed[j + lag];
+    corr = corr / limit; // normalize by length
+
+    // Wait until correlation has dipped (skip the initial high-correlation hump at low lags)
+    if (!foundDip) {
+      if (corr < prevCorr) foundDip = true;
+    } else if (corr > bestCorr) {
+      bestCorr = corr;
+      bestLag = lag;
+    }
+    prevCorr = corr;
+  }
+
+  if (bestLag < 0 || bestCorr < 0.01) return -1;
+
+  // Parabolic interpolation around the peak for sub-sample accuracy
+  let T0 = bestLag;
+  if (bestLag > minLag && bestLag < maxLag) {
+    let cm1 = 0, c0 = 0, cp1 = 0;
+    const lm1 = bestLag - 1, lp1 = bestLag + 1;
+    for (let j = 0; j < n - lp1; j++) {
+      cm1 += trimmed[j] * trimmed[j + lm1];
+      c0  += trimmed[j] * trimmed[j + bestLag];
+      cp1 += trimmed[j] * trimmed[j + lp1];
+    }
+    const a = (cm1 + cp1 - 2 * c0) / 2;
+    const b = (cp1 - cm1) / 2;
+    if (a) T0 = bestLag - b / (2 * a);
+  }
+
+  return sampleRate / T0;
+}
+
+function btnStyle(border, color) {
+  return {
+    background: "transparent",
+    border: `1px solid ${border}`,
+    color,
+    padding: "12px 24px",
+    fontSize: 11,
+    letterSpacing: "0.3em",
+    textTransform: "uppercase",
+    fontFamily: "'JetBrains Mono', monospace",
+    cursor: "pointer",
+    transition: "all 200ms ease",
+  };
+}
+
+function chipStyle(active) {
+  return {
+    background: active ? "rgba(168,216,168,0.12)" : "transparent",
+    border: `1px solid ${active ? "#a8d8a8" : "#2a2f3a"}`,
+    color: active ? "#a8d8a8" : "#8a8478",
+    padding: "5px 10px",
+    fontSize: 11,
+    fontFamily: "'JetBrains Mono', monospace",
+    cursor: "pointer",
+    borderRadius: 2,
+    transition: "all 150ms ease",
+  };
+}
+
+const labelStyle = {
+  fontSize: 10,
+  letterSpacing: "0.25em",
+  textTransform: "uppercase",
+  color: "#8a8478",
+  marginBottom: 10,
+};
+
+function Tuner() {
+  const [a4, setA4] = useState(440);
+  const [useFlats, setUseFlats] = useState(false);
+  const [instrument, setInstrument] = useState("concert");
+  const [showSettings, setShowSettings] = useState(false);
+
+  const [refPlaying, setRefPlaying] = useState(false);
+  const [refNote, setRefNote] = useState("A");
+  const [refOctave, setRefOctave] = useState(4);
+
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+  const [reading, setReading] = useState(null);
+  const [smoothCents, setSmoothCents] = useState(0);
+
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const rafRef = useRef(null);
+  const streamRef = useRef(null);
+  const bufferRef = useRef(null);
+  const recentFreqsRef = useRef([]);
+
+  const refOscRef = useRef(null);
+  const refGainRef = useRef(null);
+  const refCtxRef = useRef(null);
+
+  const transposeSemitones = INSTRUMENTS.find((i) => i.id === instrument)?.semitones ?? 0;
+
+  async function start() {
+    try {
+      setError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
+      streamRef.current = stream;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtx();
+      audioCtxRef.current = ctx;
+      // iOS sometimes starts the context suspended even within a user gesture
+      if (ctx.state === "suspended") {
+        try { await ctx.resume(); } catch (e) {}
+      }
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      bufferRef.current = new Float32Array(analyser.fftSize);
+      setRunning(true);
+      tick();
+    } catch (e) {
+      setError((e && e.message) || "Could not access microphone.");
+      setRunning(false);
+    }
+  }
+
+  function stop() {
+    setRunning(false);
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch (e) {}
+    }
+    streamRef.current = null;
+    audioCtxRef.current = null;
+    analyserRef.current = null;
+    setReading(null);
+    setSmoothCents(0);
+    recentFreqsRef.current = [];
+  }
+
+  function tick() {
+    const analyser = analyserRef.current;
+    const ctx = audioCtxRef.current;
+    const buf = bufferRef.current;
+    if (!analyser || !ctx) return;
+    analyser.getFloatTimeDomainData(buf);
+    const freq = autoCorrelate(buf, ctx.sampleRate);
+    if (freq > 0 && freq < 4000) {
+      const recent = recentFreqsRef.current;
+
+      // If the new pitch is more than ~30 cents from the recent median,
+      // it's a different string (this autoharp tuning has strings as close as
+      // 50 cents apart, so the threshold has to be well below that). Reset
+      // the buffer so the display switches instantly instead of averaging
+      // across the transition. 30 cents = ratio of 2^(30/1200) ≈ 1.0176.
+      if (recent.length >= 2) {
+        const sortedPrev = [...recent].sort((a, b) => a - b);
+        const prevMedian = sortedPrev[Math.floor(sortedPrev.length / 2)];
+        const ratio = freq / prevMedian;
+        if (ratio > 1.0176 || ratio < 0.9827) {
+          recent.length = 0;
+        }
+      }
+
+      recent.push(freq);
+      if (recent.length > 3) recent.shift();
+      const sorted = [...recent].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const r = freqToNote(median, a4, useFlats, transposeSemitones);
+      if (r) {
+        setReading(r);
+        setSmoothCents((prev) => prev + (r.cents - prev) * 0.4);
+      }
+    }
+    rafRef.current = requestAnimationFrame(tick);
+  }
+
+  function playReference() {
+    stopReference();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    refCtxRef.current = ctx;
+    const freq = noteToFreq(refNote, refOctave, a4);
+    if (!freq) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    gain.gain.linearRampToValueAtTime(0.15, ctx.currentTime + 0.05);
+    refOscRef.current = osc;
+    refGainRef.current = gain;
+    setRefPlaying(true);
+  }
+
+  function stopReference() {
+    if (refOscRef.current && refGainRef.current && refCtxRef.current) {
+      const ctx = refCtxRef.current;
+      const gain = refGainRef.current;
+      const osc = refOscRef.current;
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.05);
+      setTimeout(() => {
+        try { osc.stop(); } catch (e) {}
+        try { ctx.close(); } catch (e) {}
+      }, 80);
+    }
+    refOscRef.current = null;
+    refGainRef.current = null;
+    refCtxRef.current = null;
+    setRefPlaying(false);
+  }
+
+  useEffect(() => () => { stop(); stopReference(); }, []);
+
+  // iOS suspends AudioContext when the tab/app backgrounds; resume on return
+  useEffect(() => {
+    const onVis = () => {
+      if (!document.hidden && audioCtxRef.current && audioCtxRef.current.state === "suspended") {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  useEffect(() => {
+    if (reading) {
+      const r = freqToNote(reading.freq, a4, useFlats, transposeSemitones);
+      if (r) setReading(r);
+    }
+  }, [a4, useFlats, transposeSemitones]);
+
+  useEffect(() => {
+    if (refPlaying) playReference();
+  }, [refNote, refOctave, a4]);
+
+  const cents = reading ? smoothCents : 0;
+  const inTune = reading && Math.abs(reading.cents) <= 5;
+  const close = reading && Math.abs(reading.cents) <= 15;
+  const needleAngle = Math.max(-50, Math.min(50, cents));
+
+  const refNoteList = useFlats ? NOTE_FLATS : NOTE_SHARPS;
+  const instrumentLabel = INSTRUMENTS.find((i) => i.id === instrument).label;
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "radial-gradient(ellipse at top, #1a1f2e 0%, #0a0d14 100%)",
+      color: "#e8e6e1",
+      fontFamily: "'Cormorant Garamond', Georgia, serif",
+      padding: "32px 20px",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+    }}>
+      <div style={{ width: "100%", maxWidth: 560 }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <div style={{
+            fontSize: 11,
+            letterSpacing: "0.4em",
+            color: "#8a8478",
+            textTransform: "uppercase",
+            marginBottom: 6,
+          }}>
+            Chromatic Tuner
+          </div>
+          <div style={{
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 10,
+            color: "#5a5448",
+            letterSpacing: "0.2em",
+          }}>
+            A4 = {a4} Hz · ±5¢ tolerance · {instrumentLabel.split(" ")[0]}
+          </div>
+        </div>
+
+        <div style={{
+          background: "linear-gradient(180deg, #14181f 0%, #0c0f15 100%)",
+          border: "1px solid #2a2f3a",
+          borderRadius: 4,
+          padding: "32px 24px 24px",
+          boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04), 0 20px 60px rgba(0,0,0,0.5)",
+        }}>
+          <div style={{
+            textAlign: "center",
+            minHeight: 180,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+          }}>
+            {reading ? (
+              <>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+                  <span style={{
+                    fontSize: 144,
+                    lineHeight: 1,
+                    fontWeight: 300,
+                    letterSpacing: "-0.04em",
+                    color: inTune ? "#a8d8a8" : close ? "#e8d8a8" : "#e8e6e1",
+                    transition: "color 200ms ease",
+                    textShadow: inTune ? "0 0 30px rgba(168,216,168,0.4)" : "none",
+                  }}>
+                    {reading.note.replace(/[#b]/, "")}
+                  </span>
+                  {reading.note.includes("#") && (
+                    <span style={{ fontSize: 72, lineHeight: 1, fontWeight: 300, color: inTune ? "#a8d8a8" : close ? "#e8d8a8" : "#e8e6e1" }}>♯</span>
+                  )}
+                  {reading.note.includes("b") && (
+                    <span style={{ fontSize: 72, lineHeight: 1, fontWeight: 300, color: inTune ? "#a8d8a8" : close ? "#e8d8a8" : "#e8e6e1" }}>♭</span>
+                  )}
+                  <span style={{ fontSize: 32, color: "#5a5448", fontWeight: 300, marginLeft: 8 }}>
+                    {reading.octave}
+                  </span>
+                </div>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#6a6458", letterSpacing: "0.1em", marginTop: 8 }}>
+                  {reading.freq.toFixed(2)} Hz
+                  {transposeSemitones !== 0 && (
+                    <span style={{ marginLeft: 8, color: "#4a4438" }}>(written)</span>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 22, color: "#4a4438", fontStyle: "italic", letterSpacing: "0.05em" }}>
+                {running ? "listening…" : "press start to begin"}
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 24, position: "relative" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: "#5a5448", marginBottom: 6, letterSpacing: "0.05em" }}>
+              <span>−50</span><span>−25</span>
+              <span style={{ color: "#a8d8a8" }}>0</span>
+              <span>+25</span><span>+50</span>
+            </div>
+            <div style={{ position: "relative", height: 60, background: "#0a0d14", borderRadius: 2, border: "1px solid #1f242e", overflow: "hidden" }}>
+              <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "rgba(168,216,168,0.3)" }} />
+              <div style={{ position: "absolute", left: "calc(50% - 5%)", top: 0, bottom: 0, width: "10%", background: "linear-gradient(90deg, transparent, rgba(168,216,168,0.08), transparent)" }} />
+              {[-40, -30, -20, -10, 10, 20, 30, 40].map((v) => (
+                <div key={v} style={{ position: "absolute", left: `${50 + v}%`, top: 8, bottom: 8, width: 1, background: "rgba(255,255,255,0.06)" }} />
+              ))}
+              {reading && (
+                <div style={{
+                  position: "absolute",
+                  left: `${50 + needleAngle}%`,
+                  top: 4, bottom: 4, width: 2,
+                  transform: "translateX(-50%)",
+                  background: inTune ? "#a8d8a8" : close ? "#e8d8a8" : "#d88080",
+                  boxShadow: inTune ? "0 0 12px rgba(168,216,168,0.6)" : close ? "0 0 8px rgba(232,216,168,0.4)" : "0 0 6px rgba(216,128,128,0.4)",
+                  transition: "left 80ms ease-out, background 200ms ease",
+                }} />
+              )}
+            </div>
+            <div style={{
+              textAlign: "center",
+              marginTop: 10,
+              fontFamily: "'JetBrains Mono', monospace",
+              fontSize: 13,
+              color: reading ? (inTune ? "#a8d8a8" : close ? "#e8d8a8" : "#d88080") : "#3a3428",
+              letterSpacing: "0.1em",
+              minHeight: 18,
+            }}>
+              {reading
+                ? `${reading.cents > 0 ? "+" : ""}${reading.cents} cents ${inTune ? "· in tune" : reading.cents > 0 ? "· sharp" : "· flat"}`
+                : "—"}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 20, display: "flex", justifyContent: "center", gap: 12, flexWrap: "wrap" }}>
+          {!running ? (
+            <button onClick={start} style={btnStyle("#4a5468", "#e8e6e1")}>Start</button>
+          ) : (
+            <button onClick={stop} style={btnStyle("#6a4848", "#d88080")}>Stop</button>
+          )}
+          <button
+            onClick={() => setShowSettings((s) => !s)}
+            style={btnStyle(showSettings ? "#a8d8a8" : "#4a5468", showSettings ? "#a8d8a8" : "#a8a498")}
+          >
+            {showSettings ? "Hide settings" : "Settings"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={{ marginTop: 16, textAlign: "center", color: "#d88080", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }}>
+            {error}
+          </div>
+        )}
+
+        {showSettings && (
+          <div style={{
+            marginTop: 20,
+            background: "linear-gradient(180deg, #14181f 0%, #0c0f15 100%)",
+            border: "1px solid #2a2f3a",
+            borderRadius: 4,
+            padding: "24px",
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 12,
+            color: "#a8a498",
+          }}>
+            <div style={{ marginBottom: 24 }}>
+              <div style={labelStyle}>A4 calibration · {a4} Hz</div>
+              <input type="range" min={415} max={466} step={1} value={a4} onChange={(e) => setA4(parseInt(e.target.value, 10))} style={{ width: "100%" }} />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#5a5448", marginTop: 4 }}>
+                <span>415 Baroque</span><span>440 Standard</span><span>442 Orchestral</span><span>466</span>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {[415, 432, 440, 441, 442, 443, 444].map((v) => (
+                  <button key={v} onClick={() => setA4(v)} style={chipStyle(a4 === v)}>{v}</button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 24 }}>
+              <div style={labelStyle}>Accidentals</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setUseFlats(false)} style={chipStyle(!useFlats)}>♯ Sharps</button>
+                <button onClick={() => setUseFlats(true)} style={chipStyle(useFlats)}>♭ Flats</button>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 24 }}>
+              <div style={labelStyle}>Instrument transposition</div>
+              <select value={instrument} onChange={(e) => setInstrument(e.target.value)} style={{
+                width: "100%", background: "#0a0d14", color: "#e8e6e1",
+                border: "1px solid #2a2f3a", borderRadius: 2, padding: "8px 10px",
+                fontFamily: "'JetBrains Mono', monospace", fontSize: 12,
+              }}>
+                {INSTRUMENTS.map((i) => (
+                  <option key={i.id} value={i.id}>{i.label}</option>
+                ))}
+              </select>
+              <div style={{ fontSize: 10, color: "#5a5448", marginTop: 6, lineHeight: 1.5 }}>
+                Display shows the <em>written</em> note for your instrument.
+              </div>
+            </div>
+
+            <div>
+              <div style={labelStyle}>Reference tone (concert pitch)</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                {refNoteList.map((n) => (
+                  <button key={n} onClick={() => setRefNote(n)} style={{ ...chipStyle(refNote === n), minWidth: 36 }}>
+                    {n.replace("#", "♯").replace("b", "♭")}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: "#6a6458" }}>Octave</span>
+                {[2, 3, 4, 5, 6].map((o) => (
+                  <button key={o} onClick={() => setRefOctave(o)} style={chipStyle(refOctave === o)}>{o}</button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                {!refPlaying ? (
+                  <button onClick={playReference} style={btnStyle("#4a5468", "#a8d8a8")}>
+                    ▶ Play {refNote.replace("#", "♯").replace("b", "♭")}{refOctave}
+                  </button>
+                ) : (
+                  <button onClick={stopReference} style={btnStyle("#6a4848", "#d88080")}>■ Stop tone</button>
+                )}
+                <span style={{ fontSize: 11, color: "#6a6458" }}>
+                  {(noteToFreq(refNote, refOctave, a4) || 0).toFixed(2)} Hz
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div style={{
+          marginTop: 32,
+          textAlign: "center",
+          fontSize: 11,
+          color: "#4a4438",
+          letterSpacing: "0.1em",
+          lineHeight: 1.6,
+          fontFamily: "'JetBrains Mono', monospace",
+        }}>
+          play one note at a time · works best in a quiet room<br />
+          voice, guitar, piano, wind & string instruments
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Tuner />);
+</script>
+</body>
+</html>
