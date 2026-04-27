@@ -93,11 +93,11 @@ function autoCorrelate(buf, sampleRate) {
   let rms = 0;
   for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.01) return -1;
+  if (rms < 0.003) return -1;
 
   // Trim quiet edges (same as before)
   let r1 = 0, r2 = SIZE - 1;
-  const thres = 0.2;
+  const thres = 0.05;
   for (let i = 0; i < SIZE / 2; i++) if (Math.abs(buf[i]) < thres) { r1 = i; break; }
   for (let i = 1; i < SIZE / 2; i++) if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
   const trimmed = buf.slice(r1, r2);
@@ -231,9 +231,13 @@ function Tuner() {
         try { await ctx.resume(); } catch (e) {}
       }
       const source = ctx.createMediaStreamSource(stream);
+      // Boost quiet mic signals (autoharp on iPhone is much weaker than laptop mic)
+      const gain = ctx.createGain();
+      gain.gain.value = 8;
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      source.connect(analyser);
+      source.connect(gain);
+      gain.connect(analyser);
       analyserRef.current = analyser;
       bufferRef.current = new Float32Array(analyser.fftSize);
       setRunning(true);
@@ -512,13 +516,13 @@ function Tuner() {
                   marginBottom: 4,
                   textTransform: "uppercase",
                 }}>
-                  Mic level {audioLevel < 0.005 ? "· no signal" : audioLevel < 0.01 ? "· too quiet" : "· OK"}
+                  Mic level {audioLevel < 0.02 ? "· no signal" : audioLevel < 0.08 ? "· quiet" : "· OK"}
                 </div>
                 <div style={{ height: 4, background: "#0a0d14", border: "1px solid #1f242e", borderRadius: 2, overflow: "hidden" }}>
                   <div style={{
                     height: "100%",
-                    width: `${Math.min(100, audioLevel * 200)}%`,
-                    background: audioLevel < 0.005 ? "#d88080" : audioLevel < 0.01 ? "#e8d8a8" : "#a8d8a8",
+                    width: `${Math.min(100, audioLevel * 100)}%`,
+                    background: audioLevel < 0.02 ? "#d88080" : audioLevel < 0.08 ? "#e8d8a8" : "#a8d8a8",
                     transition: "width 80ms ease-out, background 200ms ease",
                   }} />
                 </div>
@@ -648,4 +652,5 @@ root.render(<Tuner />);
 </script>
 </body>
 </html>
+
 
