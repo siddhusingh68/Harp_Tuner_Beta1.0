@@ -201,6 +201,7 @@ function Tuner() {
   const [error, setError] = useState(null);
   const [reading, setReading] = useState(null);
   const [smoothCents, setSmoothCents] = useState(0);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
@@ -267,6 +268,15 @@ function Tuner() {
     const buf = bufferRef.current;
     if (!analyser || !ctx) return;
     analyser.getFloatTimeDomainData(buf);
+
+    // Audio level meter — peak amplitude on this frame, for diagnostics
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = Math.abs(buf[i]);
+      if (v > peak) peak = v;
+    }
+    setAudioLevel(peak);
+
     const freq = autoCorrelate(buf, ctx.sampleRate);
     if (freq > 0 && freq < 4000) {
       const recent = recentFreqsRef.current;
@@ -490,6 +500,30 @@ function Tuner() {
                 ? `${reading.cents > 0 ? "+" : ""}${reading.cents} cents ${inTune ? "· in tune" : reading.cents > 0 ? "· sharp" : "· flat"}`
                 : "—"}
             </div>
+
+            {running && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{
+                  fontFamily: "'JetBrains Mono', monospace",
+                  fontSize: 9,
+                  color: "#5a5448",
+                  letterSpacing: "0.2em",
+                  textAlign: "center",
+                  marginBottom: 4,
+                  textTransform: "uppercase",
+                }}>
+                  Mic level {audioLevel < 0.005 ? "· no signal" : audioLevel < 0.01 ? "· too quiet" : "· OK"}
+                </div>
+                <div style={{ height: 4, background: "#0a0d14", border: "1px solid #1f242e", borderRadius: 2, overflow: "hidden" }}>
+                  <div style={{
+                    height: "100%",
+                    width: `${Math.min(100, audioLevel * 200)}%`,
+                    background: audioLevel < 0.005 ? "#d88080" : audioLevel < 0.01 ? "#e8d8a8" : "#a8d8a8",
+                    transition: "width 80ms ease-out, background 200ms ease",
+                  }} />
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -614,3 +648,4 @@ root.render(<Tuner />);
 </script>
 </body>
 </html>
+
