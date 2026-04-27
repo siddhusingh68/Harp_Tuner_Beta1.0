@@ -219,9 +219,31 @@ function Tuner() {
   async function start() {
     try {
       setError(null);
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      });
+      // Aggressive constraints — iOS Safari classifies mic streams as "voice" by
+      // default, applying gain reduction, noise suppression, and auto-gain that
+      // crushes instrument signals. Disable every form of processing we can.
+      const constraints = {
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: 48000,
+          channelCount: 1,
+          // Vendor-prefixed hints honored by some iOS/WebKit versions
+          googEchoCancellation: false,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: false,
+          googTypingNoiseDetection: false,
+        },
+      };
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        // Fall back to minimal constraints if the detailed ones are rejected
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
       streamRef.current = stream;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = new AudioCtx();
@@ -231,9 +253,9 @@ function Tuner() {
         try { await ctx.resume(); } catch (e) {}
       }
       const source = ctx.createMediaStreamSource(stream);
-      // Boost quiet mic signals (autoharp on iPhone is much weaker than laptop mic)
+      // Boost quiet mic signals — iOS heavily reduces gain on speech-classified streams
       const gain = ctx.createGain();
-      gain.gain.value = 8;
+      gain.gain.value = 25;
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
       source.connect(gain);
@@ -516,13 +538,13 @@ function Tuner() {
                   marginBottom: 4,
                   textTransform: "uppercase",
                 }}>
-                  Mic level {audioLevel < 0.02 ? "· no signal" : audioLevel < 0.08 ? "· quiet" : "· OK"}
+                  Mic level {audioLevel < 0.05 ? "· no signal" : audioLevel < 0.2 ? "· quiet" : "· OK"}
                 </div>
                 <div style={{ height: 4, background: "#0a0d14", border: "1px solid #1f242e", borderRadius: 2, overflow: "hidden" }}>
                   <div style={{
                     height: "100%",
-                    width: `${Math.min(100, audioLevel * 100)}%`,
-                    background: audioLevel < 0.02 ? "#d88080" : audioLevel < 0.08 ? "#e8d8a8" : "#a8d8a8",
+                    width: `${Math.min(100, audioLevel * 50)}%`,
+                    background: audioLevel < 0.05 ? "#d88080" : audioLevel < 0.2 ? "#e8d8a8" : "#a8d8a8",
                     transition: "width 80ms ease-out, background 200ms ease",
                   }} />
                 </div>
@@ -652,5 +674,6 @@ root.render(<Tuner />);
 </script>
 </body>
 </html>
+
 
 
